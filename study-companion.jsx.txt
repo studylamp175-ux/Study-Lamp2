@@ -1,0 +1,1327 @@
+import React, { useState, useEffect, useRef, useMemo, memo, useCallback } from 'react';
+import {
+  MessageCircle, Layers, ClipboardCheck, Send, Plus, RotateCcw, Check, X, Sparkles,
+  ChevronRight, BookOpen, Trash2, Loader2, AlertCircle, Menu, Settings as SettingsIcon,
+  History, ArrowLeft, Home, Pencil, Upload, Download, Clock, Flame, Sun, Moon, Save
+} from 'lucide-react';
+
+// ---------- Theme (mutable palette, swapped by applyTheme before each render) ----------
+let INK = '#12162a';
+let SURFACE = '#1c2142';
+let SURFACE2 = '#242a52';
+let SURFACE3 = '#2c3364';
+let AMBER = '#e0a458';
+let MINT = '#6fcf97';
+let CORAL = '#e0715f';
+let TEXT = '#eef0f5';
+let MUTED = '#8b91ab';
+let RULE = 'rgba(255,255,255,0.08)';
+const ON_ACCENT = '#1b2340'; // fixed dark text for use on saturated accent buttons in either theme
+
+function applyTheme(theme) {
+  if (theme === 'light') {
+    INK = '#f7f4ee'; SURFACE = '#ffffff'; SURFACE2 = '#efeadd'; SURFACE3 = '#e3ddca';
+    AMBER = '#c2793a'; MINT = '#2f9e63'; CORAL = '#c1503c';
+    TEXT = '#20243a'; MUTED = '#6b7086'; RULE = 'rgba(0,0,0,0.08)';
+  } else {
+    INK = '#12162a'; SURFACE = '#1c2142'; SURFACE2 = '#242a52'; SURFACE3 = '#2c3364';
+    AMBER = '#e0a458'; MINT = '#6fcf97'; CORAL = '#e0715f';
+    TEXT = '#eef0f5'; MUTED = '#8b91ab'; RULE = 'rgba(255,255,255,0.08)';
+  }
+}
+
+// ---------- API helpers ----------
+async function callClaude(messages, system, maxTokens) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: maxTokens || 1000, system, messages })
+  });
+  if (!res.ok) {
+    let msg = 'Request failed (' + res.status + ')';
+    try { const e = await res.json(); if (e?.error?.message) msg = e.error.message; } catch (err) {}
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message || 'API error');
+  const text = (data.content || []).map(b => b.text || '').join('\n');
+  if (!text) throw new Error('Empty response from the model — try again.');
+  return text;
+}
+
+async function streamClaude(messages, system, maxTokens, onDelta) {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-sonnet-4-6', max_tokens: maxTokens || 800, system, messages, stream: true })
+  });
+  if (!res.ok) {
+    let msg = 'Request failed (' + res.status + ')';
+    try { const e = await res.json(); if (e?.error?.message) msg = e.error.message; } catch (err) {}
+    throw new Error(msg);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '', fullText = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      const jsonStr = line.slice(5).trim();
+      if (!jsonStr) continue;
+      let evt;
+      try { evt = JSON.parse(jsonStr); } catch (e) { continue; }
+      if (evt.type === 'content_block_delta' && evt.delta?.text) { fullText += evt.delta.text; onDelta(fullText); }
+      else if (evt.type === 'error') throw new Error(evt.error?.message || 'Stream error');
+    }
+  }
+  if (!fullText) throw new Error('Empty response from the model — try again.');
+  return fullText;
+}
+
+function stripJson(text) { return text.replace(/```json/g, '').replace(/```/g, '').trim(); }
+function parseJsonArray(text, validate) {
+  let parsed;
+  try { parsed = JSON.parse(stripJson(text)); } catch (e) { throw new Error("Couldn't read the generated content — try again."); }
+  if (!Array.isArray(parsed) || parsed.length === 0 || !parsed.every(validate)) throw new Error("The generated content came back malformed — try again.");
+  return parsed;
+}
+function todayISO() { return new Date().toISOString(); }
+function daysFromNow(n) { const d = new Date(); d.setDate(d.getDate() + n); return d.toISOString(); }
+function dateStr(d) { return d.toISOString().slice(0, 10); }
+
+// ---------- Lightweight markdown renderer (bold, inline code, code blocks, lists) ----------
+function renderInline(str, keyPrefix) {
+  const parts = [];
+  let remaining = str;
+  const regex = /(\*\*(.+?)\*\*|`(.+?)`)/;
+  let idx = 0;
+  while (remaining.length) {
+    const m = remaining.match(regex);
+    if (!m) { parts.push(remaining); break; }
+    if (m.index > 0) parts.push(remaining.slice(0, m.index));
+    if (m[2] !== undefined) parts.push(<strong key={keyPrefix + idx++}>{m[2]}</strong>);
+    else parts.push(<code key={keyPrefix + idx++} style={{ background: SURFACE3, padding: '1px 5px', borderRadius: 4, fontSize: '0.9em' }}>{m[3]}</code>);
+    remaining = remaining.slice(m.index + m[0].length);
+  }
+  return parts;
+}
+function renderMarkdown(text) {
+  const blocks = text.split(/```/);
+  const nodes = [];
+  blocks.forEach((block, bi) => {
+    if (bi % 2 === 1) {
+      const code = block.replace(/^[a-zA-Z]*\n/, '').trim();
+      nodes.push(<pre key={'cb' + bi} style={{ background: SURFACE3, padding: '10px 12px', borderRadius: 8, overflowX: 'auto', fontSize: 13, margin: '8px 0' }}><code>{code}</code></pre>);
+      return;
+    }
+    const lines = block.split('\n');
+    let listBuffer = [], listType = null;
+    const flushList = (key) => {
+      if (!listBuffer.length) return;
+      const Tag = listType === 'ol' ? 'ol' : 'ul';
+      nodes.push(<Tag key={'l' + key} style={{ margin: '6px 0', paddingLeft: 20 }}>{listBuffer.map((li, i) => <li key={i} style={{ marginBottom: 2 }}>{renderInline(li, 'li' + key + '-' + i)}</li>)}</Tag>);
+      listBuffer = []; listType = null;
+    };
+    lines.forEach((line, li) => {
+      const trimmed = line.trim();
+      const bullet = trimmed.match(/^[-*]\s+(.*)/);
+      const num = trimmed.match(/^\d+\.\s+(.*)/);
+      if (bullet) { listType = 'ul'; listBuffer.push(bullet[1]); return; }
+      if (num) { listType = 'ol'; listBuffer.push(num[1]); return; }
+      flushList(bi + '-' + li);
+      if (trimmed === '') { nodes.push(<div key={'sp' + bi + '-' + li} style={{ height: 6 }} />); return; }
+      nodes.push(<div key={'p' + bi + '-' + li}>{renderInline(line, 'p' + bi + '-' + li + '-')}</div>);
+    });
+    flushList(bi + '-end');
+  });
+  return nodes;
+}
+
+const DEFAULT_SETTINGS = { userName: '', depth: 'balanced', quizLength: 5, cardBatch: 8, theme: 'dark', timedQuiz: false, companion: { enabled: true, name: 'Lumi', avatar: '✨', persona: 'encouraging' } };
+const PERSONAS = {
+  encouraging: { label: 'Encouraging', prompt: 'You are warm, upbeat, and encouraging, like a supportive friend cheering the student on. Celebrate progress genuinely, keep things positive without being saccharine.' },
+  playful: { label: 'Playful', prompt: 'You are playful, witty, and a little silly, using light humor and casual language. Keep it fun, but still genuinely helpful.' },
+  chill: { label: 'Chill', prompt: 'You are calm, laid-back, and reassuring. Low-key tone, no pressure, gentle nudges rather than hype.' },
+  coach: { label: 'Coach', prompt: 'You are a direct, no-nonsense motivational coach. Push the student to stay disciplined and consistent, briefly and firmly, without being harsh.' }
+};
+const COMPANION_AVATARS = ['✨', '🦉', '🐙', '🌟', '🐸', '🔥', '🌙', '🐢'];
+const COMPANION_GREETING_TEMPLATES = {
+  encouraging: (name, userName, streak, due) => {
+    const hi = userName ? `Hey ${userName}, it's ${name}!` : `Hi, I'm ${name}!`;
+    return streak > 0 ? `${hi} 🔥 ${streak}-day streak — you're building something real here.${due > 0 ? ` ${due} card${due !== 1 ? 's' : ''} ready whenever you are.` : ''}` : `${hi} Ready when you are — even five minutes of review counts.`;
+  },
+  playful: (name, userName, streak, due) => {
+    const hi = userName ? `${name} here, ${userName} 👋` : `${name} here 👋`;
+    return `${hi}${streak > 0 ? ` ${streak} days strong, look at you go!` : ''}${due > 0 ? ` ${due} flashcards are staring at you, just saying.` : ' No cards due — enjoy the peace while it lasts.'}`;
+  },
+  chill: (name, userName, streak, due) => {
+    const hi = userName ? `Hey ${userName}, ${name} here.` : `Hey, ${name} here.`;
+    return `${hi} No rush.${streak > 0 ? ` ${streak}-day streak going.` : ''}${due > 0 ? ` ${due} card${due !== 1 ? 's' : ''} whenever you feel like it.` : ' Nothing urgent today.'}`;
+  },
+  coach: (name, userName, streak, due) => {
+    const hi = userName ? `${name} to ${userName}:` : `${name}:`;
+    return `${hi} ${due > 0 ? `${due} card${due !== 1 ? 's' : ''} due. Get them done now.` : 'No cards due — good. Keep the streak alive tomorrow too.'}${streak > 0 ? ` Streak: ${streak} days. Don't break it.` : ''}`;
+  }
+};
+const TUTOR_GREETING = { role: 'assistant', text: "I'm here to help you understand something. Ask about any topic, and tell me if you want the short version or the deep dive." };
+function newSession() { return { id: Date.now() + Math.random(), title: null, messages: [TUTOR_GREETING], updatedAt: todayISO() }; }
+
+// ---------- Error banner ----------
+function ErrorBanner({ message, onRetry, onDismiss }) {
+  if (!message) return null;
+  return (
+    <div className="flex items-center gap-2 px-3 py-2 rounded-lg text-xs mb-3" style={{ background: 'rgba(224,113,95,0.12)', border: `1px solid ${CORAL}`, color: '#c1503c' }}>
+      <AlertCircle size={14} style={{ flexShrink: 0 }} />
+      <span className="flex-1">{message}</span>
+      {onRetry && <button onClick={onRetry} className="font-medium underline flex-shrink-0" style={{ color: CORAL }}>Retry</button>}
+      {onDismiss && <button onClick={onDismiss} className="flex-shrink-0" style={{ color: MUTED }}><X size={13} /></button>}
+    </div>
+  );
+}
+
+// ---------- Tab bar ----------
+function TabBar({ active, setActive }) {
+  const tabs = [
+    { id: 'dashboard', label: 'Home', icon: Home },
+    { id: 'tutor', label: 'Tutor', icon: MessageCircle },
+    { id: 'flashcards', label: 'Cards', icon: Layers },
+    { id: 'quiz', label: 'Quiz', icon: ClipboardCheck }
+  ];
+  return (
+    <div className="flex gap-1 px-4 pt-3">
+      {tabs.map(t => {
+        const Icon = t.icon;
+        const isActive = active === t.id;
+        return (
+          <button key={t.id} onClick={() => setActive(t.id)} className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-t-lg text-sm font-medium transition-colors"
+            style={{ background: isActive ? SURFACE : 'transparent', color: isActive ? AMBER : MUTED, borderBottom: isActive ? `2px solid ${AMBER}` : '2px solid transparent' }}>
+            <Icon size={16} />{t.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- Toggle switch ----------
+function Switch({ checked, onChange }) {
+  return (
+    <button
+      onClick={() => onChange(!checked)}
+      className="relative flex-shrink-0"
+      style={{ width: 40, height: 24, borderRadius: 12, background: checked ? AMBER : SURFACE3, transition: 'background 0.15s' }}
+    >
+      <div style={{ position: 'absolute', top: 2, left: checked ? 18 : 2, width: 20, height: 20, borderRadius: '50%', background: '#ffffff', transition: 'left 0.15s', boxShadow: '0 1px 3px rgba(0,0,0,0.3)' }} />
+    </button>
+  );
+}
+
+// ---------- Side panel: chat history + settings ----------
+function SidePanel({ open, onClose, sessions, activeSessionId, onSelectSession, onNewChat, onDeleteSession, settings, onChangeSettings, onClearAllData, onExportData }) {
+  const [view, setView] = useState('chats');
+  const [confirmClearAll, setConfirmClearAll] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+  if (!open) return null;
+
+  function sessionLabel(s) {
+    if (s.title) return s.title;
+    const firstUser = s.messages.find(m => m.role === 'user');
+    return firstUser ? firstUser.text.slice(0, 40) : 'New chat';
+  }
+
+  return (
+    <div className="absolute inset-0 z-30 flex">
+      <div className="absolute inset-0" style={{ background: 'rgba(0,0,0,0.5)' }} onClick={onClose} />
+      <div className="relative w-[80%] max-w-[300px] h-full flex flex-col" style={{ background: SURFACE, borderRight: `1px solid ${RULE}` }}>
+        <div className="flex items-center gap-2 px-4 pt-4 pb-2">
+          <button onClick={onClose} style={{ color: MUTED }}><ArrowLeft size={18} /></button>
+          <div className="text-sm font-semibold flex-1" style={{ color: TEXT }}>{view === 'chats' ? 'Chat history' : 'Settings'}</div>
+        </div>
+        <div className="flex gap-1 px-4 pb-2">
+          <button onClick={() => setView('chats')} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: view === 'chats' ? SURFACE2 : 'transparent', color: view === 'chats' ? AMBER : MUTED }}><History size={13} /> Chats</button>
+          <button onClick={() => setView('settings')} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: view === 'settings' ? SURFACE2 : 'transparent', color: view === 'settings' ? AMBER : MUTED }}><SettingsIcon size={13} /> Settings</button>
+        </div>
+
+        {view === 'chats' && (
+          <div className="flex-1 overflow-y-auto px-3 pb-4">
+            <button onClick={onNewChat} className="w-full flex items-center gap-2 px-3 py-2.5 rounded-lg text-sm font-medium mb-2" style={{ background: AMBER, color: ON_ACCENT }}><Plus size={14} /> New chat</button>
+            <div className="space-y-1">
+              {sessions.map(s => (
+                <div key={s.id} className="rounded-lg px-3 py-2.5 flex items-center gap-2 cursor-pointer" style={{ background: s.id === activeSessionId ? SURFACE2 : 'transparent' }} onClick={() => onSelectSession(s.id)}>
+                  <div className="text-xs truncate flex-1" style={{ color: s.id === activeSessionId ? AMBER : TEXT }}>{sessionLabel(s)}</div>
+                  {confirmDeleteId === s.id ? (
+                    <button onClick={(e) => { e.stopPropagation(); onDeleteSession(s.id); setConfirmDeleteId(null); }} className="text-[10px] font-medium flex-shrink-0" style={{ color: CORAL }}>Confirm?</button>
+                  ) : (
+                    <button onClick={(e) => { e.stopPropagation(); setConfirmDeleteId(s.id); }} className="flex-shrink-0" style={{ color: MUTED }}><Trash2 size={12} /></button>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {view === 'settings' && (
+          <div className="flex-1 overflow-y-auto px-4 pb-4 space-y-5">
+            <div>
+              <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Your name</div>
+              <input
+                value={settings.userName}
+                onChange={e => onChangeSettings({ userName: e.target.value.slice(0, 20) })}
+                placeholder="What should we call you?"
+                className="w-full rounded-lg px-3 py-2 text-sm outline-none"
+                style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }}
+              />
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-2 flex items-center justify-between" style={{ color: MUTED }}>
+                <span>AI companion</span>
+                <Switch checked={settings.companion.enabled} onChange={(v) => onChangeSettings({ companion: { ...settings.companion, enabled: v } })} />
+              </div>
+              {settings.companion.enabled && (
+                <div className="space-y-2">
+                  <input
+                    value={settings.companion.name}
+                    onChange={e => onChangeSettings({ companion: { ...settings.companion, name: e.target.value.slice(0, 20) } })}
+                    placeholder="Companion name"
+                    className="w-full rounded-lg px-3 py-2 text-sm outline-none"
+                    style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }}
+                  />
+                  <div className="flex gap-1.5 flex-wrap">
+                    {COMPANION_AVATARS.map(a => (
+                      <button key={a} onClick={() => onChangeSettings({ companion: { ...settings.companion, avatar: a } })} className="w-9 h-9 rounded-lg text-lg flex items-center justify-center" style={{ background: settings.companion.avatar === a ? AMBER : SURFACE2, border: settings.companion.avatar === a ? 'none' : `1px solid ${RULE}` }}>{a}</button>
+                    ))}
+                  </div>
+                  <div className="flex gap-2 flex-wrap">
+                    {Object.entries(PERSONAS).map(([key, p]) => (
+                      <button key={key} onClick={() => onChangeSettings({ companion: { ...settings.companion, persona: key } })} className="px-3 py-1.5 rounded-lg text-xs font-medium" style={{ background: settings.companion.persona === key ? AMBER : SURFACE2, color: settings.companion.persona === key ? ON_ACCENT : TEXT }}>{p.label}</button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Appearance</div>
+              <div className="flex gap-2">
+                <button onClick={() => onChangeSettings({ theme: 'dark' })} className="flex-1 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: settings.theme === 'dark' ? AMBER : SURFACE2, color: settings.theme === 'dark' ? ON_ACCENT : TEXT }}><Moon size={13} /> Dark</button>
+                <button onClick={() => onChangeSettings({ theme: 'light' })} className="flex-1 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: settings.theme === 'light' ? AMBER : SURFACE2, color: settings.theme === 'light' ? ON_ACCENT : TEXT }}><Sun size={13} /> Light</button>
+              </div>
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Tutor explanation style</div>
+              <div className="flex gap-2">
+                {[['balanced', 'Balanced'], ['concise', 'Concise']].map(([val, label]) => (
+                  <button key={val} onClick={() => onChangeSettings({ depth: val })} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: settings.depth === val ? AMBER : SURFACE2, color: settings.depth === val ? ON_ACCENT : TEXT }}>{label}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Quiz length</div>
+              <div className="flex gap-2">
+                {[3, 5, 10].map(n => (
+                  <button key={n} onClick={() => onChangeSettings({ quizLength: n })} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: settings.quizLength === n ? AMBER : SURFACE2, color: settings.quizLength === n ? ON_ACCENT : TEXT }}>{n}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Flashcards per generation</div>
+              <div className="flex gap-2">
+                {[5, 8, 12].map(n => (
+                  <button key={n} onClick={() => onChangeSettings({ cardBatch: n })} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: settings.cardBatch === n ? AMBER : SURFACE2, color: settings.cardBatch === n ? ON_ACCENT : TEXT }}>{n}</button>
+                ))}
+              </div>
+            </div>
+            <div>
+              <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Timed quiz mode</div>
+              <div className="flex gap-2">
+                <button onClick={() => onChangeSettings({ timedQuiz: false })} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: !settings.timedQuiz ? AMBER : SURFACE2, color: !settings.timedQuiz ? ON_ACCENT : TEXT }}>Off</button>
+                <button onClick={() => onChangeSettings({ timedQuiz: true })} className="flex-1 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: settings.timedQuiz ? AMBER : SURFACE2, color: settings.timedQuiz ? ON_ACCENT : TEXT }}><Clock size={12} /> 30s/question</button>
+              </div>
+            </div>
+            <div className="pt-3 space-y-2" style={{ borderTop: `1px solid ${RULE}` }}>
+              <button onClick={onExportData} className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-xs font-medium" style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }}><Download size={13} /> Export all data</button>
+              {confirmClearAll ? (
+                <div className="text-xs space-y-2">
+                  <div style={{ color: MUTED }}>This deletes all chats, flashcards, quiz history, and your streak. This can't be undone.</div>
+                  <div className="flex gap-2">
+                    <button onClick={() => { onClearAllData(); setConfirmClearAll(false); }} className="px-3 py-1.5 rounded-lg font-medium" style={{ background: CORAL, color: ON_ACCENT }}>Confirm delete</button>
+                    <button onClick={() => setConfirmClearAll(false)} className="px-3 py-1.5 rounded-lg" style={{ color: MUTED }}>Cancel</button>
+                  </div>
+                </div>
+              ) : (
+                <button onClick={() => setConfirmClearAll(true)} className="text-xs" style={{ color: CORAL }}>Clear all data</button>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ---------- Dashboard Tab ----------
+function DashboardTab({ streak, dueCount, avgScore, cardCount, activityLog, companion, userName, onNavigate, onImportGenerate }) {
+  const [notes, setNotes] = useState('');
+  const [deckLabel, setDeckLabel] = useState('');
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState(null);
+  const [importDone, setImportDone] = useState(null);
+
+  function handleFile(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setNotes(reader.result);
+    reader.readAsText(file);
+    setDeckLabel(file.name.replace(/\.[^/.]+$/, ''));
+  }
+
+  async function runImport() {
+    if (!notes.trim() || importing) return;
+    setImporting(true); setImportError(null); setImportDone(null);
+    try {
+      const count = await onImportGenerate(notes.trim(), deckLabel.trim() || 'Imported');
+      setImportDone(count);
+      setNotes(''); setDeckLabel('');
+    } catch (e) {
+      setImportError(e.message || 'Import failed — try again.');
+    }
+    setImporting(false);
+  }
+
+  return (
+    <div className="p-5 overflow-y-auto h-full space-y-4">
+      {companion.enabled && (
+        <div className="rounded-lg p-3 flex items-center gap-3" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+          <div className="text-2xl flex-shrink-0">{companion.avatar}</div>
+          <div className="text-xs leading-relaxed" style={{ color: TEXT }}>
+            {(COMPANION_GREETING_TEMPLATES[companion.persona] || COMPANION_GREETING_TEMPLATES.encouraging)(companion.name, userName, streak, dueCount)}
+          </div>
+        </div>
+      )}
+      <div className="grid grid-cols-3 gap-2">
+        <div className="rounded-lg p-3 text-center" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+          <div className="text-xl font-bold" style={{ color: AMBER }}>{streak}</div>
+          <div className="text-[10px]" style={{ color: MUTED }}>day streak</div>
+        </div>
+        <div className="rounded-lg p-3 text-center" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+          <div className="text-xl font-bold" style={{ color: MINT }}>{dueCount}</div>
+          <div className="text-[10px]" style={{ color: MUTED }}>cards due</div>
+        </div>
+        <div className="rounded-lg p-3 text-center" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+          <div className="text-xl font-bold" style={{ color: TEXT }}>{avgScore !== null ? avgScore + '%' : '—'}</div>
+          <div className="text-[10px]" style={{ color: MUTED }}>quiz average</div>
+        </div>
+      </div>
+
+      <div>
+        <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Last 30 days</div>
+        <div className="grid grid-cols-10 gap-1">
+          {Array.from({ length: 30 }).map((_, i) => {
+            const d = new Date(); d.setDate(d.getDate() - (29 - i));
+            const key = dateStr(d);
+            const active = activityLog.includes(key);
+            return <div key={i} title={key} className="aspect-square rounded-sm" style={{ background: active ? MINT : SURFACE2, opacity: active ? 0.9 : 0.5 }} />;
+          })}
+        </div>
+      </div>
+
+      <div className="flex gap-2">
+        <button onClick={() => onNavigate('flashcards')} className="flex-1 py-2.5 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }}><Layers size={13} /> Review cards</button>
+        <button onClick={() => onNavigate('quiz')} className="flex-1 py-2.5 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }}><ClipboardCheck size={13} /> New quiz</button>
+        <button onClick={() => onNavigate('tutor')} className="flex-1 py-2.5 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }}><MessageCircle size={13} /> Ask tutor</button>
+      </div>
+
+      <div className="rounded-lg p-4" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+        <div className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: AMBER }}><Upload size={13} /> Import notes → flashcards + quiz</div>
+        <ErrorBanner message={importError} onRetry={runImport} onDismiss={() => setImportError(null)} />
+        {importDone !== null && !importError && (
+          <div className="text-xs mb-2 flex items-center gap-1.5" style={{ color: MINT }}><Check size={13} /> Added {importDone} flashcards — quiz is ready in the Quiz tab.</div>
+        )}
+        <textarea value={notes} onChange={e => setNotes(e.target.value)} placeholder="Paste notes here, or upload a .txt file…" rows={4} className="w-full rounded-lg px-3 py-2 text-sm outline-none resize-none mb-2" style={{ background: INK, color: TEXT }} />
+        <input value={deckLabel} onChange={e => setDeckLabel(e.target.value)} placeholder="Deck name (optional)" className="w-full rounded-lg px-3 py-2 text-sm outline-none mb-2" style={{ background: INK, color: TEXT }} />
+        <div className="flex gap-2">
+          <input type="file" accept=".txt,.md" id="dash-txt-input" onChange={handleFile} className="hidden" />
+          <label htmlFor="dash-txt-input" className="px-3 py-2 rounded-lg text-xs font-medium flex items-center gap-1.5 cursor-pointer" style={{ background: SURFACE, color: TEXT, border: `1px solid ${RULE}` }}><Upload size={13} /> Upload .txt</label>
+          <button onClick={runImport} disabled={importing || !notes.trim()} className="flex-1 py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: AMBER, color: ON_ACCENT, opacity: (importing || !notes.trim()) ? 0.6 : 1 }}>
+            {importing ? <Loader2 size={13} className="animate-spin" /> : <Sparkles size={13} />} {importing ? 'Generating…' : 'Generate both'}
+          </button>
+        </div>
+      </div>
+
+      <div className="text-xs" style={{ color: MUTED }}>{cardCount} card{cardCount !== 1 ? 's' : ''} total in your deck</div>
+    </div>
+  );
+}
+
+// ---------- Message list (memoized) ----------
+const MessageList = memo(function MessageList({ messages, onExplain, onAddCards, addingCards, addedCount }) {
+  const lastAssistantIdx = [...messages].map((m, i) => m.role === 'assistant' ? i : -1).filter(i => i >= 0).pop();
+  return messages.map((m, i) => (
+    <div key={i} className={`flex flex-col ${m.role === 'user' ? 'items-end' : 'items-start'}`}>
+      <div className="max-w-[80%] rounded-2xl px-4 py-3 text-[15px] leading-relaxed"
+        style={{ background: m.role === 'user' ? AMBER : SURFACE2, color: m.role === 'user' ? ON_ACCENT : TEXT, borderTopRightRadius: m.role === 'user' ? 4 : 16, borderTopLeftRadius: m.role === 'user' ? 16 : 4 }}>
+        {m.role === 'assistant' ? renderMarkdown(m.text) : <span className="whitespace-pre-wrap">{m.text}</span>}
+      </div>
+      {m.role === 'assistant' && i === lastAssistantIdx && (
+        <div className="flex gap-3 mt-1.5 px-1">
+          <button onClick={() => onExplain(m.text)} className="text-[11px] font-medium" style={{ color: MUTED }}>Explain differently</button>
+          <button onClick={() => onAddCards(m.text)} disabled={addingCards} className="text-[11px] font-medium" style={{ color: MUTED }}>{addingCards ? 'Adding…' : 'Add to flashcards'}</button>
+          {addedCount > 0 && <span className="text-[11px]" style={{ color: MINT }}>+{addedCount} added</span>}
+        </div>
+      )}
+    </div>
+  ));
+});
+
+// ---------- Tutor Tab ----------
+function TutorTab({ session, onMessagesChange, onActivity, depth, onGenerateCardsFromText }) {
+  const messages = session.messages;
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [streamingText, setStreamingText] = useState(null);
+  const [error, setError] = useState(null);
+  const [addingCards, setAddingCards] = useState(false);
+  const [addedCount, setAddedCount] = useState(0);
+  const endRef = useRef(null);
+
+  useEffect(() => { endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, loading, streamingText]);
+  useEffect(() => { setError(null); setInput(''); setStreamingText(null); setAddedCount(0); }, [session.id]);
+
+  async function sendMessage(text, isRetry) {
+    if (loading) return;
+    if (!isRetry && !(text || '').trim()) return;
+    setError(null);
+    let next;
+    if (isRetry) next = messages;
+    else { next = [...messages, { role: 'user', text: text.trim() }]; onMessagesChange(next); setInput(''); }
+    setLoading(true); setStreamingText('');
+    try {
+      const apiMessages = next.slice(-16).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.text }));
+      const depthNote = depth === 'concise' ? ' Keep answers especially short — 2 to 4 sentences unless the person clearly wants more depth.' : '';
+      const maxTokens = depth === 'concise' ? 450 : 800;
+      const reply = await streamClaude(apiMessages,
+        "You are a patient, encouraging study tutor. Explain concepts clearly with concrete examples and analogies. Use **bold** for key terms and markdown lists where helpful. Break down complex ideas step by step. Keep answers focused, not an essay. End with a brief check-in question only when it helps confirm understanding, not every time. Never just give final answers to homework-style problems without walking through the reasoning." + depthNote,
+        maxTokens, (partial) => setStreamingText(partial));
+      const finalMsgs = [...next, { role: 'assistant', text: reply }];
+      onMessagesChange(finalMsgs);
+      if (onActivity) onActivity();
+    } catch (e) {
+      setError(e.message || 'Something went wrong reaching the tutor.');
+    }
+    setStreamingText(null); setLoading(false);
+  }
+
+  const handleExplain = useCallback((prevText) => {
+    sendMessage("Can you explain that differently — a different example or analogy might help.");
+  }, [messages, depth]);
+
+  const handleAddCards = useCallback(async (text) => {
+    if (addingCards) return;
+    setAddingCards(true); setAddedCount(0);
+    try {
+      const n = await onGenerateCardsFromText(text);
+      setAddedCount(n);
+    } catch (e) {
+      setError(e.message || 'Could not create flashcards from that answer.');
+    }
+    setAddingCards(false);
+  }, [onGenerateCardsFromText, addingCards]);
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-1 overflow-y-auto px-5 py-3 space-y-4">
+        <MessageList messages={messages} onExplain={handleExplain} onAddCards={handleAddCards} addingCards={addingCards} addedCount={addedCount} />
+        {loading && (
+          <div className="flex justify-start">
+            <div className="max-w-[80%] rounded-2xl px-4 py-3 text-[15px] leading-relaxed" style={{ background: SURFACE2, color: TEXT, borderTopLeftRadius: 4 }}>
+              {streamingText ? renderMarkdown(streamingText) : <span style={{ color: MUTED }} className="flex items-center gap-2 text-sm"><Loader2 size={14} className="animate-spin" /> Thinking…</span>}
+            </div>
+          </div>
+        )}
+        <div ref={endRef} />
+      </div>
+      <div className="px-5"><ErrorBanner message={error} onRetry={() => sendMessage(null, true)} onDismiss={() => setError(null)} /></div>
+      <div className="p-4 pt-0 flex gap-2" style={{ borderTop: `1px solid ${RULE}` }}>
+        <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') sendMessage(input); }} placeholder="Ask about anything you're studying…" className="flex-1 rounded-full px-4 py-2.5 text-sm outline-none" style={{ background: SURFACE2, color: TEXT }} />
+        <button onClick={() => sendMessage(input)} disabled={loading || !input.trim()} className="rounded-full w-10 h-10 flex items-center justify-center flex-shrink-0" style={{ background: AMBER, color: ON_ACCENT, opacity: (loading || !input.trim()) ? 0.5 : 1 }}>
+          {loading ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- Flashcard row (memoized; owns its own edit state so typing in one row never re-renders siblings) ----------
+const CardRow = memo(function CardRow({ card, onSave, onDelete }) {
+  const [isEditing, setIsEditing] = useState(false);
+  const [f, setF] = useState(card.front);
+  const [b, setB] = useState(card.back);
+  const due = new Date(card.nextReview) <= new Date();
+
+  function save() { onSave(card.id, f, b); setIsEditing(false); }
+  function cancel() { setF(card.front); setB(card.back); setIsEditing(false); }
+
+  return (
+    <div className="rounded-lg px-4 py-3" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+      {isEditing ? (
+        <div>
+          <input value={f} onChange={e => setF(e.target.value)} className="w-full rounded-md px-2 py-1.5 text-sm outline-none mb-1.5" style={{ background: INK, color: TEXT }} />
+          <input value={b} onChange={e => setB(e.target.value)} className="w-full rounded-md px-2 py-1.5 text-sm outline-none mb-1.5" style={{ background: INK, color: TEXT }} />
+          <div className="flex gap-2">
+            <button onClick={save} className="flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium" style={{ background: AMBER, color: ON_ACCENT }}><Save size={11} /> Save</button>
+            <button onClick={cancel} className="px-2.5 py-1 rounded-md text-xs" style={{ color: MUTED }}>Cancel</button>
+          </div>
+        </div>
+      ) : (
+        <div className="flex justify-between items-center gap-2">
+          <div className="min-w-0 pr-1 flex-1">
+            <div className="text-sm truncate" style={{ color: TEXT }}>{card.front}</div>
+            <div className="text-xs truncate" style={{ color: MUTED }}>{card.back}</div>
+          </div>
+          <div className="text-[10px] flex-shrink-0" style={{ color: due ? AMBER : MUTED }}>
+            {due ? 'due' : `in ${Math.max(1, Math.ceil((new Date(card.nextReview) - new Date()) / 86400000))}d`}
+          </div>
+          <button onClick={() => setIsEditing(true)} className="flex-shrink-0" style={{ color: MUTED }}><Pencil size={13} /></button>
+          <button onClick={() => onDelete(card.id)} className="flex-shrink-0" style={{ color: MUTED }}><Trash2 size={14} /></button>
+        </div>
+      )}
+    </div>
+  );
+});
+
+// ---------- Flashcards Tab ----------
+function FlashcardsTab({ cards, onPersist, onActivity, cardBatch }) {
+  const [mode, setMode] = useState('list');
+  const [front, setFront] = useState(''); const [back, setBack] = useState(''); const [deckInput, setDeckInput] = useState('');
+  const [genTopic, setGenTopic] = useState(''); const [genDeck, setGenDeck] = useState('');
+  const [generating, setGenerating] = useState(false); const [genError, setGenError] = useState(null);
+  const [reviewQueue, setReviewQueue] = useState([]); const [reviewIdx, setReviewIdx] = useState(0); const [flipped, setFlipped] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [deckFilter, setDeckFilter] = useState('All');
+  const [search, setSearch] = useState('');
+  const [cramMode, setCramMode] = useState(false);
+
+  const deleteCard = useCallback((id) => onPersist(cards.filter(c => c.id !== id)), [cards, onPersist]);
+  const saveCard = useCallback((id, f, b) => onPersist(cards.map(c => c.id === id ? { ...c, front: f.trim() || c.front, back: b.trim() || c.back } : c)), [cards, onPersist]);
+
+  function addCard() {
+    if (!front.trim() || !back.trim()) return;
+    const card = { id: Date.now() + Math.random(), front: front.trim(), back: back.trim(), deck: deckInput.trim() || (deckFilter !== 'All' ? deckFilter : 'General'), interval: 1, ease: 2.5, nextReview: todayISO(), reps: 0 };
+    onPersist([...cards, card]);
+    setFront(''); setBack('');
+  }
+  function clearDeck() { onPersist(deckFilter === 'All' ? [] : cards.filter(c => c.deck !== deckFilter)); setConfirmClear(false); }
+
+  async function generateCards() {
+    if (!genTopic.trim() || generating) return;
+    setGenerating(true); setGenError(null);
+    try {
+      const n = cardBatch || 8;
+      const text = await callClaude([{ role: 'user', content: `Create ${n} flashcards for studying: "${genTopic.trim()}". Respond ONLY with a JSON array, no other text, no markdown fences. Each item: {"front": "concise question or term", "back": "clear answer, 1-2 sentences"}.` }], "You output only valid JSON arrays, nothing else.", 1200);
+      const parsed = parseJsonArray(text, c => c && typeof c.front === 'string' && typeof c.back === 'string');
+      const deck = genDeck.trim() || genTopic.trim();
+      const newCards = parsed.map(c => ({ id: Date.now() + Math.random(), front: c.front, back: c.back, deck, interval: 1, ease: 2.5, nextReview: todayISO(), reps: 0 }));
+      onPersist([...cards, ...newCards]);
+      setGenTopic(''); setGenDeck('');
+      if (onActivity) onActivity();
+    } catch (e) { setGenError(e.message || 'Could not generate flashcards.'); }
+    setGenerating(false);
+  }
+
+  function startReview() {
+    const pool = deckFilter === 'All' ? cards : cards.filter(c => c.deck === deckFilter);
+    const due = cramMode ? pool : pool.filter(c => new Date(c.nextReview) <= new Date());
+    setReviewQueue(due.map(c => c.id)); setReviewIdx(0); setFlipped(false); setMode('review');
+  }
+
+  function rate(quality) {
+    const id = reviewQueue[reviewIdx];
+    const idx = cards.findIndex(c => c.id === id);
+    if (idx === -1) { advanceReview(); return; }
+    const c = { ...cards[idx] }; c.reps += 1;
+    if (quality === 0) { c.interval = 1; c.ease = Math.max(1.3, c.ease - 0.2); }
+    else if (quality === 1) { c.interval = Math.max(1, Math.round(c.interval * 1.2)); c.ease = Math.max(1.3, c.ease - 0.05); }
+    else if (quality === 2) { c.interval = Math.round(c.interval * c.ease); }
+    else { c.interval = Math.round(c.interval * c.ease * 1.4); c.ease += 0.1; }
+    c.nextReview = daysFromNow(c.interval);
+    const updated = [...cards]; updated[idx] = c;
+    onPersist(updated);
+    if (onActivity) onActivity();
+    advanceReview();
+  }
+  function advanceReview() { setFlipped(false); if (reviewIdx + 1 < reviewQueue.length) setReviewIdx(reviewIdx + 1); else setMode('list'); }
+
+  useEffect(() => {
+    if (mode !== 'review') return;
+    function onKey(e) {
+      if (flipped) {
+        if (e.key === '1') rate(0); else if (e.key === '2') rate(1);
+        else if (e.key === '3') rate(2); else if (e.key === '4') rate(3);
+      } else if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); setFlipped(true); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [mode, flipped, reviewIdx, reviewQueue, cards]);
+
+  const decks = useMemo(() => ['All', ...Array.from(new Set(cards.map(c => c.deck || 'General')))], [cards]);
+  const deckFiltered = useMemo(() => deckFilter === 'All' ? cards : cards.filter(c => c.deck === deckFilter), [cards, deckFilter]);
+  const filteredCards = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    if (!q) return deckFiltered;
+    return deckFiltered.filter(c => c.front.toLowerCase().includes(q) || c.back.toLowerCase().includes(q));
+  }, [deckFiltered, search]);
+  const sortedCards = useMemo(() => [...filteredCards].sort((a, b) => new Date(a.nextReview) - new Date(b.nextReview)), [filteredCards]);
+  const dueCount = deckFiltered.filter(c => new Date(c.nextReview) <= new Date()).length;
+  const totalReps = deckFiltered.reduce((s, c) => s + (c.reps || 0), 0);
+
+  const forecast = useMemo(() => {
+    const days = [];
+    for (let i = 0; i < 7; i++) {
+      const day = new Date(); day.setDate(day.getDate() + i); day.setHours(23, 59, 59, 999);
+      const dayStart = new Date(day); dayStart.setHours(0, 0, 0, 0);
+      const count = deckFiltered.filter(c => { const dt = new Date(c.nextReview); return i === 0 ? dt <= day : (dt >= dayStart && dt <= day); }).length;
+      days.push({ label: i === 0 ? 'Today' : `+${i}d`, count });
+    }
+    return days;
+  }, [deckFiltered]);
+  const maxForecast = Math.max(1, ...forecast.map(d => d.count));
+
+  if (mode === 'review' && reviewQueue.length > 0) {
+    const card = cards.find(c => c.id === reviewQueue[reviewIdx]);
+    if (!card) { advanceReview(); return null; }
+    return (
+      <div className="p-6 flex flex-col items-center h-full">
+        <div className="text-xs mb-4" style={{ color: MUTED }}>{reviewIdx + 1} of {reviewQueue.length} due</div>
+        <div onClick={() => setFlipped(!flipped)} className="w-full max-w-md rounded-xl p-8 flex items-center justify-center text-center cursor-pointer relative" style={{ background: SURFACE2, minHeight: 220, border: `1px solid ${RULE}` }}>
+          <div className="absolute top-0 left-8 w-10 h-3 rounded-b-md" style={{ background: flipped ? MINT : AMBER }} />
+          <div className="text-lg leading-relaxed" style={{ color: TEXT }}>{flipped ? card.back : card.front}</div>
+        </div>
+        <div className="text-xs mt-3" style={{ color: MUTED }}>{flipped ? 'How well did you know it? (or press 1-4)' : 'Tap the card, press space, to reveal'}</div>
+        {flipped && (
+          <div className="flex gap-2 mt-5 w-full max-w-md">
+            <button onClick={() => rate(0)} className="flex-1 py-2.5 rounded-lg text-sm font-medium" style={{ background: CORAL, color: ON_ACCENT }}>Again</button>
+            <button onClick={() => rate(1)} className="flex-1 py-2.5 rounded-lg text-sm font-medium" style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }}>Hard</button>
+            <button onClick={() => rate(2)} className="flex-1 py-2.5 rounded-lg text-sm font-medium" style={{ background: AMBER, color: ON_ACCENT }}>Good</button>
+            <button onClick={() => rate(3)} className="flex-1 py-2.5 rounded-lg text-sm font-medium" style={{ background: MINT, color: ON_ACCENT }}>Easy</button>
+          </div>
+        )}
+        <button onClick={() => setMode('list')} className="text-xs mt-6" style={{ color: MUTED }}>Exit review</button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="p-5 overflow-y-auto h-full">
+      <div className="flex items-center justify-between mb-3">
+        <div>
+          <div className="text-lg font-semibold" style={{ color: TEXT }}>{filteredCards.length} card{filteredCards.length !== 1 ? 's' : ''}</div>
+          <div className="text-xs" style={{ color: MUTED }}>{dueCount} due{totalReps > 0 ? ` · ${totalReps} reviews so far` : ''}</div>
+        </div>
+        {(dueCount > 0 || cramMode) && (
+          <div className="flex items-center gap-2">
+            <button onClick={() => setCramMode(!cramMode)} className="text-[10px] font-medium px-2 py-1 rounded-full" style={{ background: cramMode ? SURFACE2 : 'transparent', color: cramMode ? AMBER : MUTED, border: `1px solid ${cramMode ? AMBER : RULE}` }}>Cram all</button>
+            <button onClick={startReview} className="flex items-center gap-1.5 px-4 py-2 rounded-full text-sm font-medium" style={{ background: AMBER, color: ON_ACCENT }}><RotateCcw size={14} /> Review</button>
+          </div>
+        )}
+      </div>
+
+      <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search cards…" className="w-full rounded-lg px-3 py-2 text-sm outline-none mb-3" style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }} />
+
+      {decks.length > 1 && (
+        <div className="flex gap-1.5 mb-3 overflow-x-auto pb-1">
+          {decks.map(d => (
+            <button key={d} onClick={() => setDeckFilter(d)} className="px-3 py-1 rounded-full text-xs font-medium flex-shrink-0" style={{ background: deckFilter === d ? AMBER : SURFACE2, color: deckFilter === d ? ON_ACCENT : MUTED }}>{d}</button>
+          ))}
+        </div>
+      )}
+
+      <div className="flex gap-1.5 mb-4">
+        {forecast.map((d, i) => (
+          <div key={i} className="flex-1 rounded-md py-1.5 text-center" style={{ background: SURFACE2, opacity: 0.5 + 0.5 * (d.count / maxForecast) }}>
+            <div className="text-xs font-semibold" style={{ color: TEXT }}>{d.count}</div>
+            <div className="text-[9px]" style={{ color: MUTED }}>{d.label}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="rounded-lg p-4 mb-3" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+        <div className="text-xs font-medium mb-2 flex items-center gap-1.5" style={{ color: AMBER }}><Sparkles size={13} /> Generate from a topic</div>
+        <ErrorBanner message={genError} onRetry={generateCards} onDismiss={() => setGenError(null)} />
+        <div className="flex gap-2 mb-2">
+          <input value={genTopic} onChange={e => setGenTopic(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') generateCards(); }} placeholder="e.g. cell mitosis, WWII causes…" className="flex-1 rounded-lg px-3 py-2 text-sm outline-none" style={{ background: INK, color: TEXT }} />
+          <button onClick={generateCards} disabled={generating || !genTopic.trim()} className="px-3 py-2 rounded-lg text-sm font-medium flex items-center gap-1.5" style={{ background: AMBER, color: ON_ACCENT, opacity: (generating || !genTopic.trim()) ? 0.6 : 1 }}>{generating ? <Loader2 size={14} className="animate-spin" /> : 'Generate'}</button>
+        </div>
+        <input value={genDeck} onChange={e => setGenDeck(e.target.value)} placeholder="Deck name (optional, defaults to topic)" className="w-full rounded-lg px-3 py-2 text-xs outline-none" style={{ background: INK, color: TEXT }} />
+      </div>
+
+      <div className="rounded-lg p-4 mb-4" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+        <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Add a card manually</div>
+        <input value={front} onChange={e => setFront(e.target.value)} placeholder="Front (question/term)" className="w-full rounded-lg px-3 py-2 text-sm outline-none mb-2" style={{ background: INK, color: TEXT }} />
+        <input value={back} onChange={e => setBack(e.target.value)} placeholder="Back (answer)" className="w-full rounded-lg px-3 py-2 text-sm outline-none mb-2" style={{ background: INK, color: TEXT }} />
+        <input value={deckInput} onChange={e => setDeckInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') addCard(); }} placeholder="Deck (optional)" className="w-full rounded-lg px-3 py-2 text-xs outline-none mb-2" style={{ background: INK, color: TEXT }} />
+        <button onClick={addCard} disabled={!front.trim() || !back.trim()} className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium" style={{ background: SURFACE, color: AMBER, border: `1px solid ${AMBER}`, opacity: (!front.trim() || !back.trim()) ? 0.5 : 1 }}><Plus size={14} /> Add card</button>
+      </div>
+
+      {filteredCards.length === 0 ? (
+        <div className="text-sm text-center py-8" style={{ color: MUTED }}>No cards yet — generate a set from a topic to get started.</div>
+      ) : (
+        <div>
+          <div className="space-y-2 mb-3">
+            {sortedCards.map(c => <CardRow key={c.id} card={c} onSave={saveCard} onDelete={deleteCard} />)}
+          </div>
+          {confirmClear ? (
+            <div className="flex items-center gap-2 text-xs">
+              <span style={{ color: MUTED }}>Delete these {filteredCards.length} cards?</span>
+              <button onClick={clearDeck} className="font-medium" style={{ color: CORAL }}>Confirm</button>
+              <button onClick={() => setConfirmClear(false)} style={{ color: MUTED }}>Cancel</button>
+            </div>
+          ) : (
+            <button onClick={() => setConfirmClear(true)} className="text-xs" style={{ color: MUTED }}>Clear {deckFilter === 'All' ? 'deck' : `"${deckFilter}"`}</button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Quiz Tab ----------
+function QuizTab({ cards, history, onPersistHistory, onActivity, quizLength, timedQuiz, pendingQuiz, onConsumePendingQuiz, onAddMissedToFlashcards }) {
+  const [stage, setStage] = useState('setup');
+  const [topic, setTopic] = useState(''); const [notes, setNotes] = useState('');
+  const [questions, setQuestions] = useState([]); const [qIdx, setQIdx] = useState(0);
+  const [answers, setAnswers] = useState([]); const [selected, setSelected] = useState(null); const [shortInput, setShortInput] = useState('');
+  const [missed, setMissed] = useState([]);
+  const [addingMissed, setAddingMissed] = useState(false); const [addedMissedCount, setAddedMissedCount] = useState(0);
+  const [revealed, setRevealed] = useState(false);
+  const [generating, setGenerating] = useState(false); const [genError, setGenError] = useState(null);
+  const [timeLeft, setTimeLeft] = useState(30);
+  const [activeTopic, setActiveTopic] = useState('');
+
+  useEffect(() => {
+    if (pendingQuiz) {
+      setQuestions(pendingQuiz.questions);
+      setActiveTopic(pendingQuiz.topic);
+      setQIdx(0); setAnswers([]); setSelected(null); setShortInput(''); setRevealed(false); setMissed([]); setAddedMissedCount(0);
+      setStage('taking');
+      onConsumePendingQuiz();
+    }
+  }, [pendingQuiz]);
+
+  useEffect(() => {
+    if (!timedQuiz || stage !== 'taking' || revealed) return;
+    setTimeLeft(30);
+    const t = setInterval(() => {
+      setTimeLeft(tl => {
+        if (tl <= 1) { clearInterval(t); handleTimeout(); return 0; }
+        return tl - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [qIdx, stage, timedQuiz]);
+
+  function handleTimeout() {
+    if (revealed) return;
+    setSelected(questions[qIdx].type === 'short' ? '' : null);
+    setRevealed(true);
+  }
+
+  function isCorrect(q, sel) {
+    if (q.type === 'short') {
+      const norm = s => (s || '').trim().toLowerCase();
+      const u = norm(sel);
+      if (!u) return false;
+      const accepted = (q.acceptableAnswers || []).map(norm);
+      return accepted.some(a => a === u || (a.length > 3 && (u.includes(a) || a.includes(u))));
+    }
+    return sel === q.correct;
+  }
+
+  async function generateQuiz(sourceOverride, topicLabel) {
+    if (generating) return;
+    if (!sourceOverride && !topic.trim() && !notes.trim()) return;
+    setGenerating(true); setGenError(null);
+    try {
+      const n = quizLength || 5;
+      const source = sourceOverride || (notes.trim() ? `these notes:\n${notes.trim()}` : `the topic: "${topic.trim()}"`);
+      const text = await callClaude([{ role: 'user', content: `Create a ${n}-question quiz based on ${source}. Mix in a couple of true/false or short-answer questions if it fits naturally, otherwise use multiple choice. Respond ONLY with a JSON array, no markdown fences, no other text. Each item: {"type":"mcq"|"tf"|"short", "question":"...", "options":["A","B"] (omit for short), "correct": 0 (index, omit for short), "acceptableAnswers":["..."] (only for short), "explanation":"one sentence why"}.` }],
+        "You output only valid JSON arrays, nothing else.", Math.min(4000, 300 * n + 500));
+      const parsed = parseJsonArray(text, q => q && typeof q.question === 'string' && (q.type === 'short' ? Array.isArray(q.acceptableAnswers) : (Array.isArray(q.options) && q.options.length >= 2 && typeof q.correct === 'number')));
+      setQuestions(parsed);
+      setActiveTopic(topicLabel || topic.trim() || 'From notes');
+      setQIdx(0); setAnswers([]); setSelected(null); setShortInput(''); setRevealed(false); setMissed([]); setAddedMissedCount(0);
+      setStage('taking');
+    } catch (e) { setGenError(e.message || 'Could not generate a quiz.'); }
+    setGenerating(false);
+  }
+
+  function generateFromStruggling() {
+    const hardest = [...cards].sort((a, b) => a.ease - b.ease).slice(0, 8);
+    const block = hardest.map(c => `Q: ${c.front}\nA: ${c.back}`).join('\n\n');
+    generateQuiz(`these flashcards the student finds difficult:\n${block}`, 'Your hardest flashcards');
+  }
+
+  function choose(i) { if (revealed) return; setSelected(i); setRevealed(true); }
+  function submitShort() { if (revealed) return; setSelected(shortInput); setRevealed(true); }
+
+  async function next() {
+    const q = questions[qIdx];
+    const correct = isCorrect(q, selected);
+    const newAnswers = [...answers, correct];
+    setAnswers(newAnswers);
+    if (!correct) {
+      const correctAnswerText = q.type === 'short' ? ((q.acceptableAnswers || [])[0] || '') : (q.options ? q.options[q.correct] : '');
+      setMissed(m => [...m, { question: q.question, answer: correctAnswerText }]);
+    }
+    setSelected(null); setShortInput(''); setRevealed(false);
+    if (qIdx + 1 < questions.length) setQIdx(qIdx + 1);
+    else {
+      const score = newAnswers.filter(Boolean).length;
+      const record = { topic: activeTopic, score, total: questions.length, date: todayISO() };
+      onPersistHistory([record, ...history].slice(0, 10));
+      if (onActivity) onActivity();
+      setStage('results');
+    }
+  }
+
+  async function addMissedToFlashcards() {
+    if (addingMissed || missed.length === 0) return;
+    setAddingMissed(true);
+    try {
+      const n = await onAddMissedToFlashcards(missed, activeTopic);
+      setAddedMissedCount(n);
+    } catch (e) {}
+    setAddingMissed(false);
+  }
+
+  const avgPct = history.length ? Math.round(100 * history.reduce((s, h) => s + h.score / h.total, 0) / history.length) : null;
+
+  if (stage === 'setup') {
+    return (
+      <div className="p-5 overflow-y-auto h-full">
+        <div className="rounded-lg p-4 mb-4" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+          <div className="text-sm font-medium mb-3" style={{ color: TEXT }}>Test yourself on a topic</div>
+          <ErrorBanner message={genError} onRetry={() => generateQuiz()} onDismiss={() => setGenError(null)} />
+          <input value={topic} onChange={e => setTopic(e.target.value)} placeholder="Topic, e.g. photosynthesis" className="w-full rounded-lg px-3 py-2 text-sm outline-none mb-2" style={{ background: INK, color: TEXT }} />
+          <div className="text-xs text-center my-2" style={{ color: MUTED }}>— or paste your notes instead —</div>
+          <textarea value={notes} onChange={e => setNotes(e.target.value)} placeholder="Paste study notes here…" rows={4} className="w-full rounded-lg px-3 py-2 text-sm outline-none resize-none" style={{ background: INK, color: TEXT }} />
+          <button onClick={() => generateQuiz()} disabled={generating || (!topic.trim() && !notes.trim())} className="w-full mt-3 py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5" style={{ background: AMBER, color: ON_ACCENT, opacity: (generating || (!topic.trim() && !notes.trim())) ? 0.6 : 1 }}>
+            {generating ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />} {generating ? 'Building quiz…' : 'Generate quiz'}
+          </button>
+          {cards.length >= 3 && (
+            <button onClick={generateFromStruggling} disabled={generating} className="w-full mt-2 py-2 rounded-lg text-xs font-medium" style={{ background: SURFACE, color: TEXT, border: `1px solid ${RULE}` }}>Quiz me on my hardest flashcards</button>
+          )}
+        </div>
+
+        {history.length > 0 && (
+          <div>
+            <div className="text-xs font-medium mb-2 flex items-center justify-between" style={{ color: MUTED }}>
+              <span>Recent scores</span>{avgPct !== null && <span>Average {avgPct}%</span>}
+            </div>
+            <div className="space-y-2">
+              {history.map((h, i) => (
+                <div key={i} className="rounded-lg px-4 py-2.5 flex justify-between items-center" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+                  <div className="text-sm truncate pr-3" style={{ color: TEXT }}>{h.topic}</div>
+                  <div className="text-sm font-medium flex-shrink-0" style={{ color: h.score === h.total ? MINT : AMBER }}>{h.score}/{h.total}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  if (stage === 'taking') {
+    const q = questions[qIdx];
+    return (
+      <div className="p-6 flex flex-col h-full">
+        <div className="flex items-center justify-between mb-4">
+          <div className="text-xs" style={{ color: MUTED }}>Question {qIdx + 1} of {questions.length}</div>
+          {timedQuiz && !revealed && <div className="text-xs font-medium flex items-center gap-1" style={{ color: timeLeft <= 10 ? CORAL : MUTED }}><Clock size={12} /> {timeLeft}s</div>}
+        </div>
+        <div className="text-base font-medium mb-5 leading-relaxed" style={{ color: TEXT }}>{q.question}</div>
+
+        {q.type === 'short' ? (
+          <div className="flex-1">
+            <input value={shortInput} onChange={e => setShortInput(e.target.value)} disabled={revealed} onKeyDown={e => { if (e.key === 'Enter') submitShort(); }} placeholder="Type your answer…" className="w-full rounded-lg px-4 py-3 text-sm outline-none mb-3" style={{ background: SURFACE2, color: TEXT, border: `1px solid ${revealed ? (isCorrect(q, selected) ? MINT : CORAL) : RULE}` }} />
+            {!revealed && <button onClick={submitShort} disabled={!shortInput.trim()} className="py-2 px-4 rounded-lg text-sm font-medium" style={{ background: AMBER, color: ON_ACCENT, opacity: !shortInput.trim() ? 0.6 : 1 }}>Submit</button>}
+            {revealed && <div className="text-xs" style={{ color: isCorrect(q, selected) ? MINT : CORAL }}>{isCorrect(q, selected) ? 'Correct!' : `Accepted answer: ${(q.acceptableAnswers || [])[0] || ''}`}</div>}
+          </div>
+        ) : (
+          <div className="space-y-2 flex-1">
+            {q.options.map((opt, i) => {
+              let bg = SURFACE2, border = RULE, color = TEXT, icon = null;
+              if (revealed) {
+                if (i === q.correct) { bg = 'rgba(111,207,151,0.15)'; border = MINT; icon = <Check size={16} color={MINT} />; }
+                else if (i === selected) { bg = 'rgba(224,113,95,0.15)'; border = CORAL; icon = <X size={16} color={CORAL} />; }
+              }
+              return (
+                <button key={i} onClick={() => choose(i)} className="w-full text-left px-4 py-3 rounded-lg text-sm flex items-center justify-between" style={{ background: bg, border: `1px solid ${border}`, color }}>
+                  <span>{opt}</span>{icon}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        {q.explanation && revealed && <div className="text-xs mb-4 mt-3 p-3 rounded-lg" style={{ background: SURFACE2, color: MUTED }}>{q.explanation}</div>}
+        {revealed && (
+          <button onClick={next} className="py-2.5 rounded-lg text-sm font-medium flex items-center justify-center gap-1.5 mt-3" style={{ background: AMBER, color: ON_ACCENT }}>
+            {qIdx + 1 < questions.length ? 'Next question' : 'See results'} <ChevronRight size={15} />
+          </button>
+        )}
+      </div>
+    );
+  }
+
+  const score = answers.filter(Boolean).length;
+  return (
+    <div className="p-6 flex flex-col items-center h-full text-center overflow-y-auto">
+      <div className="text-5xl font-bold mb-2 mt-4" style={{ color: score === questions.length ? MINT : AMBER }}>{score}/{questions.length}</div>
+      <div className="text-sm mb-5" style={{ color: MUTED }}>{score === questions.length ? 'Perfect score' : score >= questions.length * 0.6 ? 'Solid — review the ones you missed' : 'Worth another pass through this material'}</div>
+
+      {missed.length > 0 && (
+        <div className="w-full max-w-sm text-left mb-5">
+          <div className="text-xs font-medium mb-2" style={{ color: MUTED }}>Missed questions</div>
+          <div className="space-y-2 mb-3">
+            {missed.map((m, i) => (
+              <div key={i} className="rounded-lg px-3 py-2" style={{ background: SURFACE2, border: `1px solid ${RULE}` }}>
+                <div className="text-xs mb-1" style={{ color: TEXT }}>{m.question}</div>
+                <div className="text-xs" style={{ color: MINT }}>Answer: {m.answer}</div>
+              </div>
+            ))}
+          </div>
+          {addedMissedCount > 0 ? (
+            <div className="text-xs flex items-center gap-1.5" style={{ color: MINT }}><Check size={13} /> Added {addedMissedCount} to flashcards</div>
+          ) : (
+            <button onClick={addMissedToFlashcards} disabled={addingMissed} className="w-full py-2 rounded-lg text-xs font-medium flex items-center justify-center gap-1.5" style={{ background: SURFACE2, color: TEXT, border: `1px solid ${RULE}` }}>
+              {addingMissed ? <Loader2 size={13} className="animate-spin" /> : <Plus size={13} />} Add missed questions to flashcards
+            </button>
+          )}
+        </div>
+      )}
+
+      <button onClick={() => { setStage('setup'); setTopic(''); setNotes(''); }} className="px-5 py-2.5 rounded-full text-sm font-medium mb-4" style={{ background: AMBER, color: ON_ACCENT }}>New quiz</button>
+    </div>
+  );
+}
+
+// ---------- Companion bubble (floating, casual chat separate from the academic Tutor) ----------
+function CompanionBubble({ companion, messages, loading, streamingText, error, onSend, onRetry, onDismissError, onClear }) {
+  const [open, setOpen] = useState(false);
+  const [input, setInput] = useState('');
+  const [pos, setPos] = useState(null);
+  const endRef = useRef(null);
+  const draggingRef = useRef(false);
+  const dragStateRef = useRef({ startX: 0, startY: 0, posX: 0, posY: 0 });
+  const BTN = 56;
+
+  function defaultPos() { return { x: window.innerWidth - BTN - 20, y: window.innerHeight - BTN - 20 }; }
+  useEffect(() => { if (!pos) setPos(defaultPos()); }, []);
+  useEffect(() => { if (open) endRef.current?.scrollIntoView({ behavior: 'smooth' }); }, [messages, loading, streamingText, open]);
+
+  if (!companion.enabled) return null;
+  if (!pos) return null;
+
+  function submit() { if (!input.trim() || loading) return; onSend(input); setInput(''); }
+
+  function onPointerDown(e) {
+    draggingRef.current = false;
+    const startX = e.clientX, startY = e.clientY;
+    dragStateRef.current = { startX, startY, posX: pos.x, posY: pos.y };
+    function onMove(ev) {
+      const dx = ev.clientX - dragStateRef.current.startX;
+      const dy = ev.clientY - dragStateRef.current.startY;
+      if (Math.abs(dx) > 4 || Math.abs(dy) > 4) draggingRef.current = true;
+      const nx = Math.max(8, Math.min(window.innerWidth - BTN - 8, dragStateRef.current.posX + dx));
+      const ny = Math.max(8, Math.min(window.innerHeight - BTN - 8, dragStateRef.current.posY + dy));
+      setPos({ x: nx, y: ny });
+    }
+    function onUp() {
+      window.removeEventListener('pointermove', onMove);
+      window.removeEventListener('pointerup', onUp);
+    }
+    window.addEventListener('pointermove', onMove);
+    window.addEventListener('pointerup', onUp);
+  }
+
+  const PANEL_W = Math.min(320, window.innerWidth * 0.85);
+  const PANEL_H = 430;
+  const showAbove = pos.y > window.innerHeight / 2;
+  const panelTop = showAbove ? Math.max(8, pos.y - PANEL_H - 12) : Math.min(window.innerHeight - PANEL_H - 8, pos.y + BTN + 12);
+  const panelLeft = Math.max(8, Math.min(window.innerWidth - PANEL_W - 8, pos.x + BTN - PANEL_W));
+
+  return (
+    <>
+      <button
+        onPointerDown={onPointerDown}
+        onClick={() => { if (!draggingRef.current) setOpen(!open); }}
+        className="absolute z-20 w-14 h-14 rounded-full flex items-center justify-center text-2xl touch-none"
+        style={{ left: pos.x, top: pos.y, background: AMBER, boxShadow: '0 6px 20px rgba(0,0,0,0.35)', cursor: 'grab' }}
+      >
+        {companion.avatar}
+      </button>
+      {open && (
+        <div className="absolute z-20 flex flex-col overflow-hidden rounded-2xl" style={{ left: panelLeft, top: panelTop, width: PANEL_W, height: PANEL_H, background: SURFACE, border: `1px solid ${RULE}`, boxShadow: '0 10px 40px rgba(0,0,0,0.4)' }}>
+          <div className="flex items-center justify-between px-4 py-3" style={{ borderBottom: `1px solid ${RULE}` }}>
+            <div className="text-sm font-semibold flex items-center gap-1.5" style={{ color: TEXT }}><span>{companion.avatar}</span> {companion.name}</div>
+            <div className="flex items-center gap-3">
+              <button onClick={onClear} className="text-[10px] font-medium" style={{ color: MUTED }}>Clear</button>
+              <button onClick={() => setOpen(false)} style={{ color: MUTED }}><X size={15} /></button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+            {messages.length === 0 && !loading && (
+              <div className="text-xs" style={{ color: MUTED }}>Say hi to {companion.name} — quick check-ins, motivation, or just chat.</div>
+            )}
+            {messages.map((m, i) => (
+              <div key={i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className="max-w-[85%] rounded-xl px-3 py-2 text-sm leading-relaxed whitespace-pre-wrap" style={{ background: m.role === 'user' ? AMBER : SURFACE2, color: m.role === 'user' ? ON_ACCENT : TEXT }}>{m.text}</div>
+              </div>
+            ))}
+            {loading && (
+              <div className="flex justify-start">
+                <div className="rounded-xl px-3 py-2 text-sm" style={{ background: SURFACE2, color: TEXT }}>
+                  {streamingText ? streamingText : <Loader2 size={13} className="animate-spin" style={{ color: MUTED }} />}
+                </div>
+              </div>
+            )}
+            <div ref={endRef} />
+          </div>
+          <div className="px-3"><ErrorBanner message={error} onRetry={onRetry} onDismiss={onDismissError} /></div>
+          <div className="p-3 flex gap-2" style={{ borderTop: `1px solid ${RULE}` }}>
+            <input value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => { if (e.key === 'Enter') submit(); }} placeholder={`Message ${companion.name}…`} className="flex-1 rounded-full px-3 py-2 text-sm outline-none" style={{ background: SURFACE2, color: TEXT }} />
+            <button onClick={submit} disabled={loading || !input.trim()} className="rounded-full w-9 h-9 flex items-center justify-center flex-shrink-0" style={{ background: AMBER, color: ON_ACCENT, opacity: (loading || !input.trim()) ? 0.5 : 1 }}><Send size={14} /></button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ---------- App ----------
+export default function StudyCompanion() {
+  const [active, setActive] = useState('dashboard');
+  const [streak, setStreak] = useState(0);
+  const streakRef = useRef({ lastActiveDate: null, streak: 0 });
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [sessions, setSessions] = useState([newSession()]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [flashcards, setFlashcards] = useState([]);
+  const [quizHistory, setQuizHistory] = useState([]);
+  const [activityLog, setActivityLog] = useState([]);
+  const [companionMessages, setCompanionMessages] = useState([]);
+  const [companionLoading, setCompanionLoading] = useState(false);
+  const [companionStreaming, setCompanionStreaming] = useState(null);
+  const [companionError, setCompanionError] = useState(null);
+  const [pendingQuiz, setPendingQuiz] = useState(null);
+  const [loaded, setLoaded] = useState(false);
+
+  applyTheme(settings.theme);
+
+  useEffect(() => {
+    (async () => {
+      try { const r = await window.storage.get('streak', false); if (r) { const p = JSON.parse(r.value); streakRef.current = p; setStreak(p.streak || 0); } } catch (e) {}
+      try {
+        const r2 = await window.storage.get('tutor-sessions', false);
+        const parsed = r2 ? JSON.parse(r2.value) : null;
+        if (Array.isArray(parsed) && parsed.length) { setSessions(parsed); setActiveSessionId(parsed[0].id); }
+        else { const s = newSession(); setSessions([s]); setActiveSessionId(s.id); }
+      } catch (e) { const s = newSession(); setSessions([s]); setActiveSessionId(s.id); }
+      try {
+        const r3 = await window.storage.get('settings', false);
+        if (r3) {
+          const stored = JSON.parse(r3.value);
+          setSettings({ ...DEFAULT_SETTINGS, ...stored, companion: { ...DEFAULT_SETTINGS.companion, ...(stored.companion || {}) } });
+        }
+      } catch (e) {}
+      try { const r4 = await window.storage.get('flashcards', false); setFlashcards(r4 ? JSON.parse(r4.value) : []); } catch (e) { setFlashcards([]); }
+      try { const r5 = await window.storage.get('quiz-history', false); setQuizHistory(r5 ? JSON.parse(r5.value) : []); } catch (e) { setQuizHistory([]); }
+      try { const r6 = await window.storage.get('activity-log', false); setActivityLog(r6 ? JSON.parse(r6.value) : []); } catch (e) { setActivityLog([]); }
+      try { const r7 = await window.storage.get('companion-chat', false); setCompanionMessages(r7 ? JSON.parse(r7.value) : []); } catch (e) { setCompanionMessages([]); }
+      setLoaded(true);
+    })();
+  }, []);
+
+  async function persistSessions(next) {
+    const trimmed = next.slice(0, 20).map(s => ({ ...s, messages: s.messages.slice(-200) }));
+    setSessions(trimmed);
+    try { await window.storage.set('tutor-sessions', JSON.stringify(trimmed), false); } catch (e) {}
+  }
+  function updateActiveMessages(newMessages) {
+    const next = sessions.map(s => {
+      if (s.id !== activeSessionId) return s;
+      const title = s.title || (newMessages.find(m => m.role === 'user') ? newMessages.find(m => m.role === 'user').text.slice(0, 40) : null);
+      return { ...s, messages: newMessages, title, updatedAt: todayISO() };
+    });
+    persistSessions(next);
+  }
+  function handleNewChat() { const s = newSession(); persistSessions([s, ...sessions]); setActiveSessionId(s.id); setPanelOpen(false); }
+  function handleSelectSession(id) { setActiveSessionId(id); setPanelOpen(false); }
+  function handleDeleteSession(id) {
+    const remaining = sessions.filter(s => s.id !== id);
+    if (remaining.length === 0) { const s = newSession(); persistSessions([s]); setActiveSessionId(s.id); }
+    else { persistSessions(remaining); if (activeSessionId === id) setActiveSessionId(remaining[0].id); }
+  }
+  async function handleChangeSettings(patch) {
+    const next = { ...settings, ...patch };
+    setSettings(next);
+    try { await window.storage.set('settings', JSON.stringify(next), false); } catch (e) {}
+  }
+  async function persistFlashcards(next) {
+    setFlashcards(next);
+    try { await window.storage.set('flashcards', JSON.stringify(next), false); } catch (e) {}
+  }
+  async function persistQuizHistory(next) {
+    setQuizHistory(next);
+    try { await window.storage.set('quiz-history', JSON.stringify(next), false); } catch (e) {}
+  }
+
+  async function persistCompanionChat(next) {
+    const trimmed = next.slice(-60);
+    setCompanionMessages(trimmed);
+    try { await window.storage.set('companion-chat', JSON.stringify(trimmed), false); } catch (e) {}
+  }
+
+  async function sendCompanionMessage(text, isRetry) {
+    if (companionLoading) return;
+    if (!isRetry && !(text || '').trim()) return;
+    setCompanionError(null);
+    let next;
+    if (isRetry) next = companionMessages;
+    else { next = [...companionMessages, { role: 'user', text: text.trim() }]; persistCompanionChat(next); }
+    setCompanionLoading(true); setCompanionStreaming('');
+    try {
+      const persona = PERSONAS[settings.companion.persona] || PERSONAS.encouraging;
+      const sys = `You are ${settings.companion.name}, a friendly in-app study companion — separate from the academic Tutor feature, more of a casual check-in buddy. ${persona.prompt} Keep replies short, 1-3 sentences, casual chat, not a lecture.${settings.userName ? ` The student's name is ${settings.userName} — address them by name occasionally, not in every message.` : ''} The student's current stats: ${streak}-day streak, ${dueCount} flashcard${dueCount !== 1 ? 's' : ''} due, ${avgScore !== null ? avgScore + '% average quiz score' : 'no quiz history yet'}. Reference these naturally only when it fits, don't force it into every reply.`;
+      const apiMessages = next.slice(-12).map(m => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.text }));
+      const reply = await streamClaude(apiMessages, sys, 300, (p) => setCompanionStreaming(p));
+      persistCompanionChat([...next, { role: 'assistant', text: reply }]);
+    } catch (e) {
+      setCompanionError(e.message || 'Something went wrong.');
+    }
+    setCompanionStreaming(null); setCompanionLoading(false);
+  }
+
+  function clearCompanionChat() { persistCompanionChat([]); setCompanionError(null); }
+
+  async function handleAddMissedToFlashcards(missedItems, topicLabel) {
+    const newCards = missedItems.filter(m => m.answer).map(m => ({ id: Date.now() + Math.random(), front: m.question, back: m.answer, deck: topicLabel || 'From quiz', interval: 1, ease: 2.5, nextReview: todayISO(), reps: 0 }));
+    await persistFlashcards([...flashcards, ...newCards]);
+    return newCards.length;
+  }
+
+  async function handleGenerateCardsFromText(text) {
+    const result = await callClaude([{ role: 'user', content: `Create 4 flashcards distilling the key points from this explanation. Respond ONLY with a JSON array, no other text, no markdown fences. Each item: {"front":"concise question or term","back":"clear answer, 1-2 sentences"}.\n\nExplanation:\n${text}` }], "You output only valid JSON arrays, nothing else.", 700);
+    const parsed = parseJsonArray(result, c => c && typeof c.front === 'string' && typeof c.back === 'string');
+    const newCards = parsed.map(c => ({ id: Date.now() + Math.random(), front: c.front, back: c.back, deck: 'From tutor', interval: 1, ease: 2.5, nextReview: todayISO(), reps: 0 }));
+    await persistFlashcards([...flashcards, ...newCards]);
+    return newCards.length;
+  }
+
+  async function handleImportGenerate(sourceText, deckLabel) {
+    const cardsText = await callClaude([{ role: 'user', content: `Create 8 flashcards from this material. Respond ONLY with a JSON array, no other text, no markdown fences. Each item: {"front":"concise question or term","back":"clear answer, 1-2 sentences"}.\n\nMaterial:\n${sourceText}` }], "You output only valid JSON arrays, nothing else.", 1200);
+    const parsedCards = parseJsonArray(cardsText, c => c && typeof c.front === 'string' && typeof c.back === 'string');
+    const newCards = parsedCards.map(c => ({ id: Date.now() + Math.random(), front: c.front, back: c.back, deck: deckLabel, interval: 1, ease: 2.5, nextReview: todayISO(), reps: 0 }));
+    await persistFlashcards([...flashcards, ...newCards]);
+
+    const quizText = await callClaude([{ role: 'user', content: `Create a 5-question multiple choice quiz from this material. Respond ONLY with a JSON array, no markdown fences, no other text. Each item: {"type":"mcq","question":"...","options":["A","B","C","D"],"correct":0,"explanation":"one sentence why"}.\n\nMaterial:\n${sourceText}` }], "You output only valid JSON arrays, nothing else.", 1800);
+    const parsedQuiz = parseJsonArray(quizText, q => q && typeof q.question === 'string' && Array.isArray(q.options) && typeof q.correct === 'number');
+    setPendingQuiz({ questions: parsedQuiz, topic: deckLabel });
+    setActive('quiz');
+    return newCards.length;
+  }
+
+  function handleExportData() {
+    const payload = { sessions, flashcards, quizHistory, settings, streak: streakRef.current, activityLog, exportedAt: new Date().toISOString() };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = 'study-lamp-export.json';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  async function handleClearAllData() {
+    const s = newSession();
+    setSessions([s]); setActiveSessionId(s.id);
+    setFlashcards([]); setQuizHistory([]);
+    setStreak(0); streakRef.current = { lastActiveDate: null, streak: 0 };
+    setActivityLog([]);
+    setSettings(DEFAULT_SETTINGS);
+    try {
+      await window.storage.set('tutor-sessions', JSON.stringify([s]), false);
+      await window.storage.set('flashcards', JSON.stringify([]), false);
+      await window.storage.set('quiz-history', JSON.stringify([]), false);
+      await window.storage.set('streak', JSON.stringify({ lastActiveDate: null, streak: 0 }), false);
+      await window.storage.set('activity-log', JSON.stringify([]), false);
+      await window.storage.set('settings', JSON.stringify(DEFAULT_SETTINGS), false);
+    } catch (e) {}
+    setPanelOpen(false); setActive('dashboard');
+  }
+
+  async function bumpStreak() {
+    const today = dateStr(new Date());
+    const { lastActiveDate, streak: prevStreak } = streakRef.current;
+    if (lastActiveDate === today) return;
+    const yesterday = dateStr(new Date(Date.now() - 86400000));
+    const nextStreak = lastActiveDate === yesterday ? prevStreak + 1 : 1;
+    const updated = { lastActiveDate: today, streak: nextStreak };
+    streakRef.current = updated; setStreak(nextStreak);
+    try { await window.storage.set('streak', JSON.stringify(updated), false); } catch (e) {}
+    setActivityLog(prev => {
+      if (prev.includes(today)) return prev;
+      const next = [...prev, today].slice(-60);
+      window.storage.set('activity-log', JSON.stringify(next), false).catch(() => {});
+      return next;
+    });
+  }
+
+  const activeSession = sessions.find(s => s.id === activeSessionId) || sessions[0];
+  const dueCount = useMemo(() => flashcards.filter(c => new Date(c.nextReview) <= new Date()).length, [flashcards]);
+  const avgScore = useMemo(() => quizHistory.length ? Math.round(100 * quizHistory.reduce((s, h) => s + h.score / h.total, 0) / quizHistory.length) : null, [quizHistory]);
+
+  if (!loaded || !activeSession) {
+    return <div className="w-full h-screen flex items-center justify-center" style={{ background: INK, color: MUTED }}><Loader2 size={18} className="animate-spin" /></div>;
+  }
+
+  return (
+    <div className="w-full h-screen flex flex-col relative overflow-hidden" style={{ background: INK }}>
+      <div className="px-5 pt-5 pb-1 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <button onClick={() => setPanelOpen(true)} style={{ color: MUTED }}><Menu size={19} /></button>
+          <BookOpen size={18} color={AMBER} />
+          <div className="text-base font-semibold" style={{ color: TEXT, fontFamily: 'Georgia, "Times New Roman", serif' }}>Study Lamp</div>
+        </div>
+        {streak > 0 && <div className="text-xs font-medium flex items-center gap-1" style={{ color: AMBER }}><Flame size={13} /> {streak}</div>}
+      </div>
+      <TabBar active={active} setActive={setActive} />
+      <div className="flex-1 min-h-0" style={{ background: SURFACE }}>
+        {active === 'dashboard' && <DashboardTab streak={streak} dueCount={dueCount} avgScore={avgScore} cardCount={flashcards.length} activityLog={activityLog} companion={settings.companion} userName={settings.userName} onNavigate={setActive} onImportGenerate={handleImportGenerate} />}
+        {active === 'tutor' && <TutorTab session={activeSession} onMessagesChange={updateActiveMessages} onActivity={bumpStreak} depth={settings.depth} onGenerateCardsFromText={handleGenerateCardsFromText} />}
+        {active === 'flashcards' && <FlashcardsTab cards={flashcards} onPersist={persistFlashcards} onActivity={bumpStreak} cardBatch={settings.cardBatch} />}
+        {active === 'quiz' && <QuizTab cards={flashcards} history={quizHistory} onPersistHistory={persistQuizHistory} onActivity={bumpStreak} quizLength={settings.quizLength} timedQuiz={settings.timedQuiz} pendingQuiz={pendingQuiz} onConsumePendingQuiz={() => setPendingQuiz(null)} onAddMissedToFlashcards={handleAddMissedToFlashcards} />}
+      </div>
+      {!panelOpen && active === 'tutor' && (
+        <CompanionBubble
+          companion={settings.companion}
+          messages={companionMessages}
+          loading={companionLoading}
+          streamingText={companionStreaming}
+          error={companionError}
+          onSend={sendCompanionMessage}
+          onRetry={() => sendCompanionMessage(null, true)}
+          onDismissError={() => setCompanionError(null)}
+          onClear={clearCompanionChat}
+        />
+      )}
+      <SidePanel open={panelOpen} onClose={() => setPanelOpen(false)} sessions={sessions} activeSessionId={activeSessionId} onSelectSession={handleSelectSession} onNewChat={handleNewChat} onDeleteSession={handleDeleteSession} settings={settings} onChangeSettings={handleChangeSettings} onClearAllData={handleClearAllData} onExportData={handleExportData} />
+    </div>
+  );
+}
